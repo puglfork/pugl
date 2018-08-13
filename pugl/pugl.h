@@ -651,6 +651,12 @@ puglInitTransientFor(PuglView* view, uintptr_t parent);
 PUGL_API void
 puglInitContextType(PuglView* view, PuglContextType type);
 
+PUGL_API void
+puglEnterContext(PuglView* view);
+
+PUGL_API void
+puglLeaveContext(PuglView* view, bool flush);
+
 /**
    @}
 */
