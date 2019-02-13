@@ -1,5 +1,6 @@
 /*
-  Copyright 2012-2016 David Robillard <http://drobilla.net>
+  Copyright 2012-2014 David Robillard <http://drobilla.net>
+  Copyright 2012-2019 Filipe Coelho <falktx@falktx.com>
 
   Permission to use, copy, modify, and/or distribute this software for any
   purpose with or without fee is hereby granted, provided that the above
@@ -20,50 +21,46 @@
    Note this file contains function definitions, so it must be compiled into
    the final binary exactly once.  Each platform specific implementation file
    including it once should achieve this.
-
-   If you are copying the pugl code into your source tree, the following
-   symbols can be defined to tweak pugl behaviour:
-
-   PUGL_HAVE_CAIRO: Include Cairo support code.
-   PUGL_HAVE_GL:    Include OpenGL support code.
 */
 
-#include <stdlib.h>
-#include <string.h>
-
-#include "pugl/pugl.h"
+#include "pugl.h"
 
 typedef struct PuglInternalsImpl PuglInternals;
 
 struct PuglViewImpl {
 	PuglHandle       handle;
-	PuglEventFunc    eventFunc;
+	PuglCloseFunc    closeFunc;
+	PuglDisplayFunc  displayFunc;
+	PuglKeyboardFunc keyboardFunc;
+	PuglMotionFunc   motionFunc;
+	PuglMouseFunc    mouseFunc;
+	PuglReshapeFunc  reshapeFunc;
+	PuglResizeFunc   resizeFunc;
+	PuglScrollFunc   scrollFunc;
+	PuglSpecialFunc  specialFunc;
+	PuglFileSelectedFunc fileSelectedFunc;
 
-	PuglInternals* impl;
-
-	char*            windowClass;
+	PuglInternals*   impl;
 	PuglNativeWindow parent;
-	PuglContextType  ctx_type;
 	uintptr_t        transient_parent;
 
 	int      width;
 	int      height;
 	int      min_width;
 	int      min_height;
-	int      min_aspect_x;
-	int      min_aspect_y;
-	int      max_aspect_x;
-	int      max_aspect_y;
+	int      mods;
+	bool     mouse_in_view;
 	bool     ignoreKeyRepeat;
 	bool     redisplay;
-	bool     resizable;
-	bool     visible;
+	bool     user_resizable;
+	bool     pending_resize;
+	uint32_t event_timestamp_ms;
 };
 
 PuglInternals* puglInitInternals(void);
 
 PuglView*
-puglInit(int* pargc, char** argv)
+puglInit(void)
 {
 	PuglView* view = (PuglView*)calloc(1, sizeof(PuglView));
 	if (!view) {
@@ -72,13 +69,13 @@ puglInit(int* pargc, char** argv)
 
 	PuglInternals* impl = puglInitInternals();
 	if (!impl) {
+		free(view);
 		return NULL;
 	}
 
-	view->ctx_type = PUGL_GL;
-	view->impl     = impl;
-	view->width    = 640;
-	view->height   = 480;
+	view->impl   = impl;
+	view->width  = 640;
+	view->height = 480;
 
 	return view;
 }
@@ -98,38 +95,15 @@ puglInitWindowMinSize(PuglView* view, int width, int height)
 }
 
 void
-puglInitWindowAspectRatio(PuglView* view,
-                          int       min_x,
-                          int       min_y,
-                          int       max_x,
-                          int       max_y)
-{
-	view->min_aspect_x = min_x;
-	view->min_aspect_y = min_y;
-	view->max_aspect_x = max_x;
-	view->max_aspect_y = max_y;
-}
-
-void
-puglInitWindowClass(PuglView* view, const char* name)
-{
-	const size_t len = strlen(name);
-
-	free(view->windowClass);
-	view->windowClass = (char*)calloc(1, len + 1);
-	memcpy(view->windowClass, name, len);
-}
-
-void
 puglInitWindowParent(PuglView* view, PuglNativeWindow parent)
 {
 	view->parent = parent;
 }
 
 void
-puglInitResizable(PuglView* view, bool resizable)
+puglInitUserResizable(PuglView* view, bool resizable)
 {
-	view->resizable = resizable;
+	view->user_resizable = resizable;
 }
 
 void
@@ -138,10 +112,33 @@ puglInitTransientFor(PuglView* view, uintptr_t parent)
 	view->transient_parent = parent;
 }
 
-void
-puglInitContextType(PuglView* view, PuglContextType type)
+PuglView*
+puglCreate(PuglNativeWindow parent,
+           const char*      title,
+           int              min_width,
+           int              min_height,
+           int              width,
+           int              height,
+           bool             resizable,
+           unsigned long    transientId)
 {
-	view->ctx_type = type;
+	PuglView* view = puglInit();
+	if (!view) {
+		return NULL;
+	}
+
+	puglInitWindowParent(view, parent);
+	puglInitWindowMinSize(view, min_width, min_height);
+	puglInitWindowSize(view, width, height);
+	puglInitUserResizable(view, resizable);
+	puglInitTransientFor(view, transientId);
+
+	if (!puglCreateWindow(view, title)) {
+		free(view);
+		return NULL;
+	}
+
+	return view;
 }
 
 void
@@ -156,17 +153,16 @@ puglGetHandle(PuglView* view)
 	return view->handle;
 }
 
-bool
-puglGetVisible(PuglView* view)
+uint32_t
+puglGetEventTimestamp(PuglView* view)
 {
-	return view->visible;
+	return view->event_timestamp_ms;
 }
 
-void
-puglGetSize(PuglView* view, int* width, int* height)
+int
+puglGetModifiers(PuglView* view)
 {
-	*width  = view->width;
-	*height = view->height;
+	return view->mods;
 }
 
 void
@@ -176,66 +172,92 @@ puglIgnoreKeyRepeat(PuglView* view, bool ignore)
 }
 
 void
-puglSetEventFunc(PuglView* view, PuglEventFunc eventFunc)
+puglSetCloseFunc(PuglView* view, PuglCloseFunc closeFunc)
 {
-	view->eventFunc = eventFunc;
+	view->closeFunc = closeFunc;
 }
 
-/** Return the code point for buf, or the replacement character on error. */
-static uint32_t
-puglDecodeUTF8(const uint8_t* buf)
+void
+puglSetDisplayFunc(PuglView* view, PuglDisplayFunc displayFunc)
 {
-#define FAIL_IF(cond) { if (cond) return 0xFFFD; }
-
-	// http://en.wikipedia.org/wiki/UTF-8
-
-	if (buf[0] < 0x80) {
-		return buf[0];
-	} else if (buf[0] < 0xC2) {
-		return 0xFFFD;
-	} else if (buf[0] < 0xE0) {
-		FAIL_IF((buf[1] & 0xC0) != 0x80);
-		return (buf[0] << 6) + buf[1] - 0x3080;
-	} else if (buf[0] < 0xF0) {
-		FAIL_IF((buf[1] & 0xC0) != 0x80);
-		FAIL_IF(buf[0] == 0xE0 && buf[1] < 0xA0);
-		FAIL_IF((buf[2] & 0xC0) != 0x80);
-		return (buf[0] << 12) + (buf[1] << 6) + buf[2] - 0xE2080;
-	} else if (buf[0] < 0xF5) {
-		FAIL_IF((buf[1] & 0xC0) != 0x80);
-		FAIL_IF(buf[0] == 0xF0 && buf[1] < 0x90);
-		FAIL_IF(buf[0] == 0xF4 && buf[1] >= 0x90);
-		FAIL_IF((buf[2] & 0xC0) != 0x80);
-		FAIL_IF((buf[3] & 0xC0) != 0x80);
-		return ((buf[0] << 18) +
-		        (buf[1] << 12) +
-		        (buf[2] << 6) +
-		        buf[3] - 0x3C82080);
-	}
-	return 0xFFFD;
+	view->displayFunc = displayFunc;
 }
+
+void
+puglSetKeyboardFunc(PuglView* view, PuglKeyboardFunc keyboardFunc)
+{
+	view->keyboardFunc = keyboardFunc;
+}
+
+void
+puglSetMotionFunc(PuglView* view, PuglMotionFunc motionFunc)
+{
+	view->motionFunc = motionFunc;
+}
+
+void
+puglSetMouseFunc(PuglView* view, PuglMouseFunc mouseFunc)
+{
+	view->mouseFunc = mouseFunc;
+}
+
+void
+puglSetReshapeFunc(PuglView* view, PuglReshapeFunc reshapeFunc)
+{
+	view->reshapeFunc = reshapeFunc;
+}
+
+void
+puglSetResizeFunc(PuglView* view, PuglResizeFunc resizeFunc)
+{
+	view->resizeFunc = resizeFunc;
+}
+
+void
+puglSetScrollFunc(PuglView* view, PuglScrollFunc scrollFunc)
+{
+	view->scrollFunc = scrollFunc;
+}
+
+void
+puglSetSpecialFunc(PuglView* view, PuglSpecialFunc specialFunc)
+{
+	view->specialFunc = specialFunc;
+}
+
+void
+puglSetFileSelectedFunc(PuglView* view, PuglFileSelectedFunc fileSelectedFunc)
+{
+	view->fileSelectedFunc = fileSelectedFunc;
+}
+
+void
+puglEnterContext(PuglView* view);
+
+void
+puglLeaveContext(PuglView* view, bool flush);
 
 static void
-puglDispatchEvent(PuglView* view, const PuglEvent* event)
+puglDefaultReshape(int width, int height)
 {
-	switch (event->type) {
-	case PUGL_NOTHING:
-		break;
-	case PUGL_CONFIGURE:
-		view->width  = event->configure.width;
-		view->height = event->configure.height;
-		puglEnterContext(view);
-		view->eventFunc(view, event);
-		puglLeaveContext(view, false);
-		break;
-	case PUGL_EXPOSE:
-		if (event->expose.count == 0) {
-			puglEnterContext(view);
-			view->eventFunc(view, event);
-			puglLeaveContext(view, true);
-		}
-		break;
-	default:
-		view->eventFunc(view, event);
-	}
+#ifdef PUGL_OPENGL
+#ifdef ROBTK_HERE
+	glViewport(0, 0, width, height);
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+	glOrtho(-1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+#else
+	glMatrixMode(GL_PROJECTION);
+	glLoadIdentity();
+	glOrtho(0, width, height, 0, 0, 1);
+	glViewport(0, 0, width, height);
+
+	glMatrixMode(GL_MODELVIEW);
+	glLoadIdentity();
+#endif
+#endif // PUGL_OPENGL
 }
